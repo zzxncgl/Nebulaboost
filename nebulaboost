@@ -1,0 +1,600 @@
+--[[
+    ╔══════════════════════════════════════════════╗
+    ║  NEBULA BOOST  -  Anti-Lag para Delta        ║
+    ║  UI espacial/neón · Menú y botón arrastrables║
+    ╚══════════════════════════════════════════════╝
+
+    Funciones (todas reversibles con el botón "RESTAURAR TODO"):
+      1. Gráficos al mínimo  (calidad, sombras, post-procesado, agua, etc.)
+      2. Texturas ligeras    (SmoothPlastic, sin decals/texturas/reflejos)
+      3. Limpiar efectos     (partículas, trails, beams, fuego, humo, luces)
+      4. Ocultar accesorios  (de otros jugadores/NPCs, no los tuyos)
+]]
+
+------------------------------------------------------------------
+-- 0. SERVICIOS Y LIMPIEZA DE EJECUCIONES PREVIAS
+------------------------------------------------------------------
+local Players          = game:GetService("Players")
+local Lighting         = game:GetService("Lighting")
+local Workspace        = game:GetService("Workspace")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local GUI_NAME    = "NebulaBoostUI"
+
+local env = (getgenv and getgenv()) or _G
+if env.NebulaBoostCleanup then
+    pcall(env.NebulaBoostCleanup)
+end
+
+local connections = {} -- conexiones globales para limpiar al re-ejecutar
+local function track(conn)
+    table.insert(connections, conn)
+    return conn
+end
+
+------------------------------------------------------------------
+-- 1. MÓDULOS DE OPTIMIZACIÓN
+--    Cada módulo guarda los valores originales para poder restaurarlos.
+------------------------------------------------------------------
+local function createModule(cfg)
+    local M = {
+        active = false,
+        saved  = {},   -- [instancia] = { propiedad = valorOriginal }
+        conns  = {},
+        token  = 0,    -- invalida escaneos antiguos
+    }
+
+    -- Cambia una propiedad guardando antes su valor original
+    function M.set(inst, prop, value)
+        return pcall(function()
+            local bucket = M.saved[inst]
+            if not bucket then
+                bucket = {}
+                M.saved[inst] = bucket
+            end
+            if bucket[prop] == nil then
+                bucket[prop] = inst[prop]
+            end
+            inst[prop] = value
+        end)
+    end
+
+    function M.enable()
+        if M.active then return end
+        M.active = true
+        M.token += 1
+        local myToken = M.token
+
+        if cfg.onEnable then pcall(cfg.onEnable, M) end
+
+        -- Escaneo inicial en lotes para no congelar el juego
+        task.spawn(function()
+            local n = 0
+            for _, root in ipairs(cfg.roots()) do
+                for _, inst in ipairs(root:GetDescendants()) do
+                    if not M.active or M.token ~= myToken then return end
+                    pcall(cfg.process, M, inst)
+                    n += 1
+                    if n % 300 == 0 then task.wait() end
+                end
+            end
+        end)
+
+        -- Objetos que aparezcan después también se optimizan
+        for _, root in ipairs(cfg.roots()) do
+            table.insert(M.conns, root.DescendantAdded:Connect(function(inst)
+                if M.active then
+                    task.defer(function()
+                        pcall(cfg.process, M, inst)
+                    end)
+                end
+            end))
+        end
+    end
+
+    function M.disable()
+        if not M.active then return end
+        M.active = false
+        M.token += 1
+
+        for _, c in ipairs(M.conns) do c:Disconnect() end
+        M.conns = {}
+
+        for inst, props in pairs(M.saved) do
+            for prop, value in pairs(props) do
+                pcall(function() inst[prop] = value end)
+            end
+        end
+        M.saved = {}
+
+        if cfg.onDisable then pcall(cfg.onDisable, M) end
+    end
+
+    return M
+end
+
+-- 1.1 GRÁFICOS AL MÍNIMO -------------------------------------------------
+local Graphics = createModule({
+    roots = function() return { Lighting } end,
+
+    process = function(M, inst)
+        if inst:IsA("PostEffect") then            -- Blur, Bloom, SunRays, DoF, ColorCorrection
+            M.set(inst, "Enabled", false)
+        elseif inst:IsA("Atmosphere") then
+            M.set(inst, "Density", 0)
+            M.set(inst, "Haze", 0)
+        elseif inst:IsA("Clouds") then
+            M.set(inst, "Enabled", false)
+        end
+    end,
+
+    onEnable = function(M)
+        -- Iluminación
+        M.set(Lighting, "GlobalShadows", false)
+        M.set(Lighting, "ShadowSoftness", 0)
+        M.set(Lighting, "EnvironmentSpecularScale", 0)
+
+        -- Terreno / agua
+        local terrain = Workspace:FindFirstChildOfClass("Terrain")
+        if terrain then
+            M.set(terrain, "WaterWaveSize", 0)
+            M.set(terrain, "WaterWaveSpeed", 0)
+            M.set(terrain, "WaterReflectance", 0)
+            M.set(terrain, "Decoration", false)
+        end
+
+        -- Calidad gráfica global
+        pcall(function()
+            local r = settings().Rendering
+            M.origQuality = r.QualityLevel
+            r.QualityLevel = Enum.QualityLevel.Level01
+        end)
+
+        -- Tecnología de iluminación (solo si el ejecutor lo permite)
+        if gethiddenproperty and sethiddenproperty then
+            pcall(function()
+                M.origTech = gethiddenproperty(Lighting, "Technology")
+                sethiddenproperty(Lighting, "Technology", Enum.Technology.Compatibility)
+            end)
+        end
+    end,
+
+    onDisable = function(M)
+        pcall(function()
+            if M.origQuality then settings().Rendering.QualityLevel = M.origQuality end
+        end)
+        if M.origTech and sethiddenproperty then
+            pcall(function() sethiddenproperty(Lighting, "Technology", M.origTech) end)
+        end
+        M.origQuality, M.origTech = nil, nil
+    end,
+})
+
+-- 1.2 TEXTURAS LIGERAS ---------------------------------------------------
+local Textures = createModule({
+    roots = function() return { Workspace } end,
+
+    process = function(M, inst)
+        if inst:IsA("Terrain") then return end
+
+        if inst:IsA("BasePart") then
+            M.set(inst, "Material", Enum.Material.SmoothPlastic)
+            M.set(inst, "Reflectance", 0)
+            M.set(inst, "CastShadow", false)
+            if inst:IsA("MeshPart") then
+                M.set(inst, "TextureID", "")
+            end
+        elseif inst:IsA("Decal") or inst:IsA("Texture") then
+            M.set(inst, "Transparency", 1)
+        elseif inst:IsA("SurfaceAppearance") then
+            M.set(inst, "Parent", nil) -- se restaura al volver a su padre original
+        end
+    end,
+})
+
+-- 1.3 LIMPIAR EFECTOS PESADOS --------------------------------------------
+local Effects = createModule({
+    roots = function() return { Workspace } end,
+
+    process = function(M, inst)
+        if inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam")
+            or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles")
+            or inst:IsA("Highlight") or inst:IsA("Light") then
+            M.set(inst, "Enabled", false)
+        end
+    end,
+})
+
+-- 1.4 OCULTAR ACCESORIOS AJENOS ------------------------------------------
+local function isOtherAccessory(inst)
+    local acc = inst:IsA("Accessory") and inst or inst:FindFirstAncestorOfClass("Accessory")
+    if not acc then return false end
+    local char = acc.Parent
+    return char ~= nil
+        and char ~= LocalPlayer.Character
+        and char:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
+local Accessories = createModule({
+    roots = function() return { Workspace } end,
+
+    process = function(M, inst)
+        if inst:IsA("BasePart") then
+            if isOtherAccessory(inst) then
+                M.set(inst, "Transparency", 1)
+                M.set(inst, "CastShadow", false)
+            end
+        elseif inst:IsA("Decal") or inst:IsA("Texture") then
+            if isOtherAccessory(inst) then
+                M.set(inst, "Transparency", 1)
+            end
+        elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") then
+            if isOtherAccessory(inst) then
+                M.set(inst, "Enabled", false)
+            end
+        end
+    end,
+})
+
+------------------------------------------------------------------
+-- 2. PALETA Y HELPERS DE UI
+------------------------------------------------------------------
+local C = {
+    black   = Color3.fromRGB(6, 5, 16),
+    panel   = Color3.fromRGB(13, 10, 28),
+    row     = Color3.fromRGB(20, 16, 42),
+    header  = Color3.fromRGB(24, 18, 52),
+    violet  = Color3.fromRGB(139, 92, 246),
+    blue    = Color3.fromRGB(56, 128, 255),
+    text    = Color3.fromRGB(238, 233, 255),
+    muted   = Color3.fromRGB(150, 145, 195),
+    off     = Color3.fromRGB(45, 40, 80),
+    danger  = Color3.fromRGB(255, 80, 120),
+}
+
+local function new(class, props, children)
+    local obj = Instance.new(class)
+    for k, v in pairs(props or {}) do obj[k] = v end
+    for _, child in ipairs(children or {}) do child.Parent = obj end
+    return obj
+end
+
+local function corner(parent, radius)
+    return new("UICorner", { CornerRadius = UDim.new(0, radius), Parent = parent })
+end
+
+local spinning = {} -- degradados que giran (efecto neón animado)
+
+local function neonGradient(parent, animated)
+    local g = new("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0,   C.violet),
+            ColorSequenceKeypoint.new(0.5, C.blue),
+            ColorSequenceKeypoint.new(1,   C.violet),
+        }),
+        Parent = parent,
+    })
+    if animated then table.insert(spinning, g) end
+    return g
+end
+
+local function neonStroke(parent, thickness, animated, transparency)
+    local s = new("UIStroke", {
+        Color = Color3.new(1, 1, 1),
+        Thickness = thickness,
+        Transparency = transparency or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        Parent = parent,
+    })
+    neonGradient(s, animated)
+    return s
+end
+
+local function tween(obj, time, goal, style, dir)
+    local t = TweenService:Create(obj, TweenInfo.new(time, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), goal)
+    t:Play()
+    return t
+end
+
+local function viewport()
+    local cam = Workspace.CurrentCamera
+    return cam and cam.ViewportSize or Vector2.new(800, 600)
+end
+
+------------------------------------------------------------------
+-- 3. SISTEMA DE ARRASTRE (mouse + táctil, sin trabarse)
+------------------------------------------------------------------
+local function makeDraggable(handle, target, onClick)
+    local dragging, dragInput, dragStart, startPos, moved = false, nil, nil, nil, false
+
+    track(handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            moved     = false
+            dragStart = input.Position
+            startPos  = target.Position
+
+            local changed
+            changed = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    changed:Disconnect()
+                    if not moved and onClick then onClick() end
+                end
+            end)
+        end
+    end))
+
+    track(handle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end))
+
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and input == dragInput then
+            local delta = input.Position - dragStart
+            if delta.Magnitude > 6 then moved = true end
+            if moved then
+                local vp, size = viewport(), target.AbsoluteSize
+                local x = math.clamp(startPos.X.Offset + delta.X, 0, math.max(0, vp.X - size.X))
+                local y = math.clamp(startPos.Y.Offset + delta.Y, 0, math.max(0, vp.Y - size.Y))
+                target.Position = UDim2.fromOffset(x, y)
+            end
+        end
+    end))
+end
+
+------------------------------------------------------------------
+-- 4. CONSTRUCCIÓN DE LA INTERFAZ
+------------------------------------------------------------------
+local function getGuiParent()
+    if gethui then
+        local ok, h = pcall(gethui)
+        if ok and h then return h end
+    end
+    local ok, core = pcall(function() return game:GetService("CoreGui") end)
+    if ok and core then return core end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local gui = new("ScreenGui", {
+    Name = GUI_NAME,
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    DisplayOrder = 999,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
+gui.Parent = getGuiParent()
+
+local vp = viewport()
+
+-- 4.1 MENÚ PRINCIPAL ------------------------------------------------------
+local MENU_W = 300
+local MENU_H = math.min(380, vp.Y - 40)
+
+local menu = new("Frame", {
+    Name = "Menu",
+    Size = UDim2.fromOffset(MENU_W, MENU_H),
+    Position = UDim2.fromOffset(math.max(0, (vp.X - MENU_W) / 2), math.max(0, (vp.Y - MENU_H) / 2)),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    Visible = false,
+    Parent = gui,
+})
+corner(menu, 16)
+neonStroke(menu, 2, true)
+new("UIGradient", {
+    Color = ColorSequence.new(C.panel, C.black),
+    Rotation = 90,
+    Parent = menu,
+})
+local menuScale = new("UIScale", { Scale = 1, Parent = menu })
+
+-- Estrellas decorativas (temática espacial)
+local stars = new("Frame", {
+    Name = "Stars", Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1, Parent = menu,
+})
+local rng = Random.new(7)
+for _ = 1, 34 do
+    local s = rng:NextNumber(1, 2.2)
+    new("Frame", {
+        Size = UDim2.fromOffset(s, s),
+        Position = UDim2.fromScale(rng:NextNumber(0.04, 0.96), rng:NextNumber(0.04, 0.96)),
+        BackgroundColor3 = (rng:NextInteger(1, 3) == 1) and C.blue or ((rng:NextInteger(1, 2) == 1) and C.violet or Color3.new(1, 1, 1)),
+        BackgroundTransparency = rng:NextNumber(0.35, 0.85),
+        BorderSizePixel = 0,
+        Parent = stars,
+    }, { new("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+end
+
+-- Cabecera (zona de arrastre del menú)
+local header = new("Frame", {
+    Name = "Header",
+    Position = UDim2.fromOffset(8, 8),
+    Size = UDim2.new(1, -16, 0, 40),
+    BackgroundColor3 = C.header,
+    BorderSizePixel = 0,
+    Active = true,
+    Parent = menu,
+})
+corner(header, 12)
+neonStroke(header, 1, false, 0.55)
+
+local title = new("TextLabel", {
+    Position = UDim2.fromOffset(14, 0),
+    Size = UDim2.new(1, -60, 1, 0),
+    BackgroundTransparency = 1,
+    Text = "NEBULA BOOST",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBlack,
+    TextSize = 17,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = header,
+})
+neonGradient(title, true)
+
+local closeBtn = new("TextButton", {
+    Name = "Close",
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -8, 0.5, 0),
+    Size = UDim2.fromOffset(28, 28),
+    BackgroundColor3 = Color3.fromRGB(40, 20, 62),
+    Text = "X",
+    TextColor3 = C.text,
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    AutoButtonColor = false,
+    Parent = header,
+})
+corner(closeBtn, 14)
+track(closeBtn.MouseEnter:Connect(function()
+    tween(closeBtn, 0.15, { BackgroundColor3 = C.danger })
+end))
+track(closeBtn.MouseLeave:Connect(function()
+    tween(closeBtn, 0.15, { BackgroundColor3 = Color3.fromRGB(40, 20, 62) })
+end))
+
+-- Lista desplazable de botones
+local scroll = new("ScrollingFrame", {
+    Name = "List",
+    Position = UDim2.fromOffset(10, 56),
+    Size = UDim2.new(1, -20, 1, -88),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = C.violet,
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    CanvasSize = UDim2.new(),
+    Parent = menu,
+})
+new("UIListLayout", {
+    Padding = UDim.new(0, 8),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+    Parent = scroll,
+})
+new("UIPadding", { PaddingRight = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), Parent = scroll })
+
+-- Pie con FPS / memoria
+local footer = new("TextLabel", {
+    Position = UDim2.new(0, 10, 1, -28),
+    Size = UDim2.new(1, -20, 0, 22),
+    BackgroundTransparency = 1,
+    Text = "FPS --  |  RAM -- MB",
+    TextColor3 = C.muted,
+    Font = Enum.Font.Code,
+    TextSize = 12,
+    Parent = menu,
+})
+
+-- 4.2 FILAS DE FUNCIONES (interruptores) ----------------------------------
+local toggleVisuals = {} -- funciones para refrescar el estado visual de cada interruptor
+
+local function addToggle(order, name, desc, module)
+    local row = new("TextButton", {
+        Name = name,
+        Size = UDim2.new(1, 0, 0, 60),
+        BackgroundColor3 = C.row,
+        AutoButtonColor = false,
+        Text = "",
+        LayoutOrder = order,
+        Parent = scroll,
+    })
+    corner(row, 12)
+    local stroke = new("UIStroke", {
+        Color = C.violet, Transparency = 0.7, Thickness = 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = row,
+    })
+
+    new("TextLabel", {
+        Position = UDim2.fromOffset(12, 8),
+        Size = UDim2.new(1, -74, 0, 18),
+        BackgroundTransparency = 1,
+        Text = name,
+        TextColor3 = C.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = row,
+    })
+    new("TextLabel", {
+        Position = UDim2.fromOffset(12, 27),
+        Size = UDim2.new(1, -74, 0, 28),
+        BackgroundTransparency = 1,
+        Text = desc,
+        TextColor3 = C.muted,
+        Font = Enum.Font.Gotham,
+        TextSize = 11,
+        TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        Parent = row,
+    })
+
+    local track_ = new("Frame", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -12, 0.5, 0),
+        Size = UDim2.fromOffset(42, 22),
+        BackgroundColor3 = C.off,
+        BorderSizePixel = 0,
+        Parent = row,
+    })
+    corner(track_, 11)
+    local knob = new("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 3, 0.5, 0),
+        Size = UDim2.fromOffset(16, 16),
+        BackgroundColor3 = C.muted,
+        BorderSizePixel = 0,
+        Parent = track_,
+    })
+    corner(knob, 8)
+
+    local function refresh()
+        if module.active then
+            tween(track_, 0.2, { BackgroundColor3 = C.violet })
+            tween(knob, 0.2, { Position = UDim2.new(1, -19, 0.5, 0), BackgroundColor3 = Color3.new(1, 1, 1) })
+            tween(stroke, 0.2, { Transparency = 0.15, Color = C.blue })
+        else
+            tween(track_, 0.2, { BackgroundColor3 = C.off })
+            tween(knob, 0.2, { Position = UDim2.new(0, 3, 0.5, 0), BackgroundColor3 = C.muted })
+            tween(stroke, 0.2, { Transparency = 0.7, Color = C.violet })
+        end
+    end
+    table.insert(toggleVisuals, refresh)
+
+    track(row.MouseButton1Click:Connect(function()
+        if module.active then module.disable() else module.enable() end
+        refresh()
+    end))
+end
+
+local function addActionButton(order, text, primary, callback)
+    local btn = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = primary and Color3.new(1, 1, 1) or C.row,
+        AutoButtonColor = false,
+        Text = text,
+        TextColor3 = Color3.new(1, 1, 1),
+        Font = Enum.Font.GothamBlack,
+        TextSize = 13,
+        LayoutOrder = order,
+        Parent = scroll,
+    })
+    corner(btn, 12)
+    if primary then
+        new("UIGradient", {
+            Color = ColorSequence.new(C.violet, C.blue),
+            Rotation = 0,
+            Parent = btn,
+        })
+    else
+        new("UIStroke", 
